@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Photobooth Pose Gợi Ý</title>
+
+<!-- Tailwind CSS -->
+<script src="https://cdn.tailwindcss.com/3.4.16"></script>
+<!-- TensorFlow.js + COCO-SSD (chạy 100% trên trình duyệt) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+<style>
+  :root {
+    --blue: #1d4ed8;
+    --blue-soft: #dbeafe;
+    --ink: #0f172a;
+  }
+  html, body { height: 100%; }
+  body {
+    font-family: "Be Vietnam Pro", system-ui, sans-serif;
+    background: #f5f8ff;
+    color: var(--ink);
+    overflow: hidden;
+  }
+
+  /* Bố cục 60/40 — ngang: trái/phải, dọc: trên/dưới */
+  .app { display: flex; height: 100vh; gap: 16px; padding: 16px; }
+  .cam-zone  { flex: 0 0 60%; min-width: 0; min-height: 0; }
+  .pose-zone { flex: 1 1 40%; min-width: 0; min-height: 0; }
+  @media (orientation: portrait) {
+    .app { flex-direction: column; }
+    .cam-zone  { flex: 0 0 calc(60% - 8px); }
+    .pose-zone { flex: 1 1 auto; }
+  }
+
+  /* Lật gương video */
+  #video { transform: scaleX(-1); object-fit: cover; }
+
+  /* Hiệu ứng */
+  .flash { animation: flash .45s ease-out forwards; }
+  @keyframes flash { 0% { opacity: 1 } 100% { opacity: 0 } }
+
+  .count-pop { animation: pop .9s ease-out forwards; }
+  @keyframes pop {
+    0% { transform: scale(.4); opacity: 0 }
+    25% { transform: scale(1.1); opacity: 1 }
+    100% { transform: scale(1); opacity: .9 }
+  }
+
+  .card-enter { animation: cardIn .45s cubic-bezier(.2,.8,.2,1); }
+  @keyframes cardIn {
+    from { transform: translateY(14px) scale(.98); opacity: 0 }
+    to   { transform: none; opacity: 1 }
+  }
+
+  .pulse-dot { animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
+    border-radius: 14px; font-weight: 600; padding: .8rem 1.1rem;
+    transition: transform .12s, background .2s, box-shadow .2s;
+    user-select: none;
+  }
+  .btn:active { transform: scale(.96); }
+  .btn-primary { background: var(--blue); color: #fff; box-shadow: 0 8px 20px -8px rgba(29,78,216,.6); }
+  .btn-primary:hover { background: #1e40af; }
+  .btn-ghost { background: #fff; color: var(--blue); border: 1.5px solid #c7d7fe; }
+  .btn-ghost:hover { background: var(--blue-soft); }
+  .btn-ghost[aria-pressed="true"] { background: var(--blue); color: #fff; border-color: var(--blue); }
+
+  .thumb[aria-current="true"] { border-color: var(--blue); background: var(--blue-soft); }
+  .pose-art svg { width: 100%; height: 100%; }
+</style>
+</head>
+
+<body>
+<div class="app">
+
+  <!-- ===================== KHU VỰC CAMERA (60%) ===================== -->
+  <section class="cam-zone relative rounded-3xl overflow-hidden bg-slate-900 shadow-xl ring-1 ring-slate-200">
+    <video id="video" class="absolute inset-0 w-full h-full" autoplay playsinline muted></video>
+    <canvas id="overlay" class="absolute inset-0 w-full h-full pointer-events-none"></canvas>
+
+    <!-- Huy hiệu số người -->
+    <div class="absolute top-4 left-4 flex items-center gap-2 bg-white/95 backdrop-blur px-4 py-2 rounded-full shadow-lg">
+      <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-amber-400 pulse-dot"></span>
+      <span class="text-sm md:text-base font-semibold text-slate-800">
+        Đang nhận diện: <span id="liveCount" class="text-blue-700 font-extrabold">0</span> người
+      </span>
+    </div>
+
+    <!-- Thanh "đang ổn định" (debounce 1.5s) -->
+    <div id="stabilizeWrap" class="absolute top-16 left-4 hidden bg-white/90 rounded-full px-3 py-1.5 shadow text-xs font-medium text-slate-600 items-center gap-2">
+      <span>Giữ yên để đổi gợi ý</span>
+      <span class="w-20 h-1.5 bg-blue-100 rounded-full overflow-hidden">
+        <span id="stabilizeBar" class="block h-full bg-blue-600" style="width:0%"></span>
+      </span>
+    </div>
+
+    <!-- Điều khiển nhanh -->
+    <div class="absolute top-4 right-4 flex gap-2">
+      <button id="btnDebug" class="btn btn-ghost !py-2 !px-3 text-sm" aria-pressed="true" title="Bật/tắt khung nhận diện (phím D)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/></svg>
+        <span class="hidden sm:inline">Khung</span>
+      </button>
+      <button id="btnFull" class="btn btn-ghost !py-2 !px-3 text-sm" title="Toàn màn hình (phím F)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+      </button>
+    </div>
+
+    <!-- Nút chụp thử -->
+    <div class="absolute bottom-5 left-0 right-0 flex justify-center">
+      <button id="btnShoot" class="btn btn-primary text-lg !px-7 !py-4 !rounded-full" disabled>
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        Chụp thử 3-2-1
+      </button>
+    </div>
+
+    <!-- Đếm ngược -->
+    <div id="countdown" class="absolute inset-0 hidden items-center justify-center pointer-events-none">
+      <span id="countdownNum" class="text-white font-extrabold drop-shadow-[0_6px_24px_rgba(0,0,0,.5)]" style="font-size: min(40vh, 28vw)">3</span>
+    </div>
+    <!-- Flash -->
+    <div id="flash" class="absolute inset-0 bg-white opacity-0 pointer-events-none"></div>
+
+    <!-- Màn hình tải / lỗi -->
+    <div id="loader" class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-slate-900 text-white text-center px-6">
+      <div class="w-12 h-12 rounded-full border-4 border-white/20 border-t-white animate-spin"></div>
+      <p id="loaderText" class="text-lg font-medium">Đang khởi động camera…</p>
+      <p id="loaderSub" class="text-sm text-white/60 max-w-md">Hình ảnh chỉ được xử lý ngay trên máy này, không gửi lên máy chủ.</p>
+    </div>
+  </section>
+
+  <!-- ===================== KHU VỰC GỢI Ý (40%) ===================== -->
+  <aside class="pose-zone flex flex-col bg-white rounded-3xl shadow-xl ring-1 ring-slate-200 p-5 md:p-6 overflow-hidden">
+    <header class="flex items-center justify-between gap-3 mb-4">
+      <div>
+        <p class="text-xs font-semibold tracking-widest text-blue-600 uppercase">Gợi ý tạo dáng</p>
+        <h1 id="groupTitle" class="text-2xl md:text-3xl font-extrabold text-slate-900 leading-tight">Chờ khách…</h1>
+      </div>
+      <span id="groupChip" class="shrink-0 text-sm font-bold bg-blue-50 text-blue-700 px-3 py-1.5 rounded-full">—</span>
+    </header>
+
+    <!-- Thẻ gợi ý chính -->
+    <div id="poseCard" class="flex-1 min-h-0 flex flex-col rounded-2xl border-2 border-blue-100 bg-gradient-to-b from-blue-50/70 to-white p-4 md:p-5">
+      <div id="poseArt" class="pose-art flex-1 min-h-0 flex items-center justify-center"></div>
+      <div class="pt-3">
+        <h2 id="poseName" class="text-xl md:text-2xl font-bold text-blue-800"></h2>
+        <p id="poseDesc" class="mt-1 text-slate-600 leading-relaxed"></p>
+        <p id="poseTip" class="mt-2 text-sm font-medium text-slate-500"></p>
+      </div>
+    </div>
+
+    <!-- Danh sách dáng khác trong nhóm -->
+    <div id="thumbs" class="grid grid-cols-5 gap-2 mt-4"></div>
+
+    <div class="flex gap-3 mt-4">
+      <button id="btnShuffle" class="btn btn-primary flex-1" disabled>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+        Đổi gợi ý khác
+      </button>
+    </div>
+    <p class="mt-3 text-center text-xs text-slate-400">Phím tắt: <b>Space</b> chụp · <b>S</b> đổi dáng · <b>D</b> khung · <b>F</b> toàn màn hình</p>
+  </aside>
+</div>
+
+<!-- ===================== MODAL ẢNH XEM TRƯỚC ===================== -->
+<div id="previewModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4">
+  <div class="bg-white rounded-3xl shadow-2xl p-5 max-w-3xl w-full card-enter">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-xl font-bold text-slate-900">Ảnh chụp thử</h3>
+      <button id="btnClose" class="text-slate-400 hover:text-slate-700 text-2xl leading-none px-2" aria-label="Đóng">×</button>
+    </div>
+    <img id="previewImg" class="w-full max-h-[65vh] object-contain rounded-2xl bg-slate-100" alt="Ảnh xem trước" />
+    <div class="flex flex-wrap gap-3 mt-4 justify-end">
+      <button id="btnRetake" class="btn btn-ghost">Chụp lại</button>
+      <a id="btnDownload" class="btn btn-primary" download="photobooth.jpg">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+        Tải ảnh
+      </a>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+   CẤU HÌNH CHUNG
+   ===================================================================== */
+const CONFIG = {
+  STABLE_MS: 1500,        // Số người phải giữ ổn định bao lâu (ms) mới đổi nhóm gợi ý
+  MIN_SCORE: 0.55,        // Độ tin cậy tối thiểu để tính là 1 người
+  MAX_DETECTIONS: 12,     // Số đối tượng tối đa mỗi khung hình
+  DETECT_INTERVAL: 90,    // Khoảng cách giữa 2 lần nhận diện (ms) ~ 11 fps
+  MODEL_BASE: "lite_mobilenet_v2", // 'lite_mobilenet_v2' (nhanh) | 'mobilenet_v2' (chính xác hơn)
+  COUNTDOWN_FROM: 3,
+};
+
+/* =====================================================================
+   ★★★ POSE_DATABASE — KHO GỢI Ý DÁNG CHỤP ★★★
+   ---------------------------------------------------------------------
+   - Mỗi nhóm (solo / couple / trio / group) là một mảng các dáng.
+   - name : tên dáng       - desc : cách đặt tay / tư thế
+   - tip  : gợi ý biểu cảm - image: link ảnh mẫu thực tế của tiệm.
+       → Nếu điền `image: "https://.../anh-mau.jpg"` (hoặc "images/abc.jpg"
+         đặt cạnh file này) thì app hiển thị ảnh thật thay cho hình SVG.
+   - art  : cấu hình hình minh họa SVG (người que) — có thể bỏ qua nếu dùng image.
+       figs: danh sách người { x, y(độ cao lệch), s(tỉ lệ), face(emoji),
+             l/r: điểm tay trái/phải tính từ vai, legs:'spread', tilt(độ) }
+       fx  : biểu tượng trang trí { t: emoji, x, y, size }
+   ===================================================================== */
+const POSE_DATABASE = {
+  solo: [
+    {
+      name: "Chữ V nháy mắt",
+      desc: "Giơ tay làm chữ V cạnh mắt, tay còn lại thả lỏng hoặc chống hông. Hơi nghiêng vai về phía máy.",
+      tip: "Biểu cảm: nháy một mắt + cười tươi lộ răng 😉",
+      image: null,
+      art: { figs: [{ x: 120, face: "😉", r: [[14, -12], [18, -34]] }], fx: [{ t: "✌️", x: 146, y: 42, size: 22 }] },
+    },
+    {
+      name: "Chống cằm nghiêng đầu",
+      desc: "Một tay gập lại, mu bàn tay đỡ nhẹ dưới cằm. Nghiêng đầu khoảng 15° về phía tay.",
+      tip: "Biểu cảm: mắt nhìn thẳng ống kính, mỉm cười nhẹ 🙂",
+      image: null,
+      art: { figs: [{ x: 120, face: "🙂", tilt: -14, r: [[16, 14], [6, -14]] }], fx: [{ t: "✨", x: 165, y: 48, size: 18 }] },
+    },
+    {
+      name: "Che nửa mặt nghệ thuật",
+      desc: "Xòe bàn tay che hờ một bên mắt hoặc nửa khuôn mặt, các ngón tay hơi tách để lộ ánh mắt.",
+      tip: "Biểu cảm: ánh mắt sâu, môi khép nhẹ — phong cách tạp chí 📸",
+      image: null,
+      art: { figs: [{ x: 120, face: "😶", r: [[18, 6], [6, -22]], l: [[-12, 18], [-8, 34]] }], fx: [{ t: "🖐️", x: 128, y: 42, size: 20 }] },
+    },
+    {
+      name: "Cool ngầu khoanh tay",
+      desc: "Khoanh tay trước ngực, đứng nghiêng người 45°, trọng tâm dồn về một chân.",
+      tip: "Biểu cảm: cằm hơi nâng, cười nửa miệng 😎",
+      image: null,
+      art: { figs: [{ x: 120, face: "😎", l: [[-10, 12], [14, 16]], r: [[10, 12], [-14, 18]] }] },
+    },
+    {
+      name: "Chống hông tự tin",
+      desc: "Hai tay chống hông, chân trước chân sau, ngực mở rộng như siêu mẫu.",
+      tip: "Biểu cảm: cười rạng rỡ, nhìn hơi chếch lên trên 🤩",
+      image: null,
+      art: { figs: [{ x: 120, face: "🤩", l: [[-20, 14], [-8, 30]], r: [[20, 14], [8, 30]] }], fx: [{ t: "⭐", x: 160, y: 40, size: 18 }] },
+    },
+  ],
+
+  couple: [
+    {
+      name: "Ghép nửa trái tim",
+      desc: "Mỗi người cong một tay thành nửa hình trái tim, đứng sát nhau để ghép thành một trái tim hoàn chỉnh.",
+      tip: "Biểu cảm: cả hai cười tươi nhìn vào máy 🥰",
+      image: null,
+      art: {
+        figs: [
+          { x: 88, face: "🥰", r: [[14, -8], [28, -24]] },
+          { x: 152, face: "🥰", l: [[-14, -8], [-28, -24]] },
+        ],
+        fx: [{ t: "❤️", x: 120, y: 48, size: 24 }],
+      },
+    },
+    {
+      name: "Tựa lưng vào nhau",
+      desc: "Hai người đứng quay lưng tựa vào nhau, khoanh tay hoặc đút tay túi quần, mặt quay về máy.",
+      tip: "Biểu cảm: tự tin, cười nửa miệng như poster phim 😏",
+      image: null,
+      art: {
+        figs: [
+          { x: 104, face: "😏", tilt: -6, l: [[-10, 12], [14, 16]], r: [[10, 12], [-14, 18]] },
+          { x: 136, face: "😎", tilt: 6, l: [[-10, 12], [14, 16]], r: [[10, 12], [-14, 18]] },
+        ],
+      },
+    },
+    {
+      name: "Một hài – một nghiêm",
+      desc: "Một người làm mặt hề, lè lưỡi, tay vẫy loạn; người kia đứng nghiêm, khoanh tay như không quen.",
+      tip: "Biểu cảm: càng tương phản càng vui 🤪 vs 😐",
+      image: null,
+      art: {
+        figs: [
+          { x: 88, face: "🤪", tilt: 10, l: [[-16, -8], [-24, -28]], r: [[16, -8], [26, -24]] },
+          { x: 152, face: "😐", l: [[-10, 12], [14, 16]], r: [[10, 12], [-14, 18]] },
+        ],
+      },
+    },
+    {
+      name: "Khoác vai chữ V",
+      desc: "Người bên trái khoác tay qua vai bạn, người bên phải giơ tay chữ V. Đổi vai ở pose tiếp theo.",
+      tip: "Biểu cảm: nghiêng đầu về nhau, cười thật tươi 😁",
+      image: null,
+      art: {
+        figs: [
+          { x: 98, face: "😁", tilt: 6, r: [[22, -4], [44, 0]] },
+          { x: 142, face: "😄", tilt: -6, r: [[14, -12], [18, -34]] },
+        ],
+        fx: [{ t: "✌️", x: 168, y: 42, size: 20 }],
+      },
+    },
+    {
+      name: "Cụng trán nhìn nhau",
+      desc: "Đứng đối diện, nghiêng đầu chạm nhẹ trán vào nhau, tay nắm tay để thấp phía trước.",
+      tip: "Biểu cảm: nhắm mắt hoặc nhìn nhau cười 😊",
+      image: null,
+      art: {
+        figs: [
+          { x: 104, face: "😊", tilt: 14, r: [[12, 16], [16, 30]] },
+          { x: 136, face: "😊", tilt: -14, l: [[-12, 16], [-16, 30]] },
+        ],
+        fx: [{ t: "💞", x: 120, y: 30, size: 18 }],
+      },
+    },
+  ],
+
+  trio: [
+    {
+      name: "Xếp tầng cao – trung – thấp",
+      desc: "Người cao đứng sau, người giữa khom nhẹ, người thấp ngồi xổm phía trước tạo 3 tầng đầu so le.",
+      tip: "Biểu cảm: mỗi tầng một kiểu cười khác nhau 😄😆😁",
+      image: null,
+      art: {
+        figs: [
+          { x: 85, face: "😄", s: 0.75, y: 22 },
+          { x: 120, face: "😆", s: 0.9, y: 8 },
+          { x: 155, face: "😁", s: 1.05, y: -6 },
+        ],
+      },
+    },
+    {
+      name: "Chụm đầu tam giác",
+      desc: "Ba người chụm đầu sát nhau thành hình tam giác, tay khoác vai nhau phía sau.",
+      tip: "Biểu cảm: nhìn thẳng máy, cười hết cỡ 🤗",
+      image: null,
+      art: {
+        figs: [
+          { x: 98, face: "🤗", tilt: 14, y: 4, r: [[18, 0], [34, 2]] },
+          { x: 120, face: "😄", y: -8 },
+          { x: 142, face: "🤗", tilt: -14, y: 4, l: [[-18, 0], [-34, 2]] },
+        ],
+        fx: [{ t: "🔺", x: 120, y: 22, size: 16 }],
+      },
+    },
+    {
+      name: "Cùng chỉ về người ở giữa",
+      desc: "Hai người hai bên cùng chỉ tay vào người đứng giữa, người giữa làm dáng 'ngôi sao' tự hào.",
+      tip: "Biểu cảm: hai bên trầm trồ 😲, người giữa tự tin 😎",
+      image: null,
+      art: {
+        figs: [
+          { x: 72, face: "😲", r: [[16, -4], [32, -10]] },
+          { x: 120, face: "😎", l: [[-20, 14], [-8, 30]], r: [[20, 14], [8, 30]] },
+          { x: 168, face: "😲", l: [[-16, -4], [-32, -10]] },
+        ],
+        fx: [{ t: "⭐", x: 120, y: 26, size: 18 }],
+      },
+    },
+    {
+      name: "Siêu anh hùng 3 hướng",
+      desc: "Người giữa đứng thẳng chống hông, hai người hai bên quay lưng nhẹ ra ngoài, tay giơ nắm đấm.",
+      tip: "Biểu cảm: nghiêm túc như poster bom tấn 💥",
+      image: null,
+      art: {
+        figs: [
+          { x: 76, face: "😤", tilt: -6, l: [[-16, -10], [-22, -32]] },
+          { x: 120, face: "😠", l: [[-20, 14], [-8, 30]], r: [[20, 14], [8, 30]] },
+          { x: 164, face: "😤", tilt: 6, r: [[16, -10], [22, -32]] },
+        ],
+        fx: [{ t: "💥", x: 120, y: 24, size: 20 }],
+      },
+    },
+    {
+      name: "Hàng ngang khoác vai",
+      desc: "Ba người đứng thành hàng, khoác vai nhau, cùng nghiêng người về một phía.",
+      tip: "Biểu cảm: cười to như vừa nghe chuyện vui 😂",
+      image: null,
+      art: {
+        figs: [
+          { x: 80, face: "😂", tilt: 10, r: [[20, -4], [40, 0]] },
+          { x: 120, face: "😂", tilt: 10, r: [[20, -4], [40, 0]] },
+          { x: 160, face: "😂", tilt: 10 },
+        ],
+      },
+    },
+  ],
+
+  group: [
+    {
+      name: "Totem ló đầu",
+      desc: "Xếp hàng dọc nối đuôi nhau, mỗi người lần lượt nghiêng đầu ló ra một bên ở độ cao khác nhau.",
+      tip: "Biểu cảm: mỗi tầng một kiểu mặt ngộ nghĩnh 🙃",
+      image: null,
+      art: {
+        heads: [
+          { x: 126, y: 28, face: "😜" },
+          { x: 112, y: 58, face: "😄" },
+          { x: 128, y: 88, face: "🙃" },
+          { x: 112, y: 118, face: "😆" },
+        ],
+        extra: '<rect x="124" y="12" width="40" height="140" rx="8" fill="#e0e7ff"/>',
+      },
+    },
+    {
+      name: "Đồng loạt nhảy ăn mừng",
+      desc: "Đếm 1-2-3 rồi cả nhóm cùng bật nhảy, giơ hai tay lên trời. Chụp liên tiếp để bắt khoảnh khắc đẹp nhất.",
+      tip: "Biểu cảm: há miệng hò reo 🥳",
+      image: null,
+      art: {
+        figs: [
+          { x: 54, face: "🥳", y: -8, s: 0.82, l: [[-14, -12], [-22, -34]], r: [[14, -12], [22, -34]] },
+          { x: 98, face: "😆", y: -14, s: 0.82, l: [[-14, -12], [-22, -34]], r: [[14, -12], [22, -34]] },
+          { x: 142, face: "🥳", y: -6, s: 0.82, l: [[-14, -12], [-22, -34]], r: [[14, -12], [22, -34]] },
+          { x: 186, face: "😆", y: -12, s: 0.82, l: [[-14, -12], [-22, -34]], r: [[14, -12], [22, -34]] },
+        ],
+        fx: [{ t: "🎉", x: 30, y: 26, size: 18 }, { t: "🎊", x: 212, y: 30, size: 18 }],
+      },
+    },
+    {
+      name: "Tạo dáng ngôi sao",
+      desc: "Mỗi người dang rộng tay chân thành hình ngôi sao 5 cánh, đứng sát nhau để tay chạm tay.",
+      tip: "Biểu cảm: mắt mở to, cười rạng rỡ ✨",
+      image: null,
+      art: {
+        figs: [
+          { x: 50, face: "🤩", s: 0.8, legs: "spread", l: [[-16, -6], [-28, -20]], r: [[16, -6], [28, -20]] },
+          { x: 96, face: "😄", s: 0.8, legs: "spread", l: [[-16, -6], [-28, -20]], r: [[16, -6], [28, -20]] },
+          { x: 142, face: "🤩", s: 0.8, legs: "spread", l: [[-16, -6], [-28, -20]], r: [[16, -6], [28, -20]] },
+          { x: 188, face: "😄", s: 0.8, legs: "spread", l: [[-16, -6], [-28, -20]], r: [[16, -6], [28, -20]] },
+        ],
+        fx: [{ t: "⭐", x: 120, y: 20, size: 18 }],
+      },
+    },
+    {
+      name: "Mỗi người một biểu cảm",
+      desc: "Thống nhất trước: người ngạc nhiên, người giận dỗi, người mê mẩn, người ngầu. Đứng bình thường, chỉ diễn bằng mặt.",
+      tip: "Biểu cảm: càng phóng đại càng vui 😱😤😍😎",
+      image: null,
+      art: {
+        figs: [
+          { x: 54, face: "😱", s: 0.82, l: [[-10, -6], [-6, -26]], r: [[10, -6], [6, -26]] },
+          { x: 98, face: "😤", s: 0.82, l: [[-10, 12], [14, 16]], r: [[10, 12], [-14, 18]] },
+          { x: 142, face: "😍", s: 0.82, tilt: 10 },
+          { x: 186, face: "😎", s: 0.82, l: [[-20, 14], [-8, 30]], r: [[20, 14], [8, 30]] },
+        ],
+      },
+    },
+    {
+      name: "Đội hình chữ V",
+      desc: "Người nổi bật nhất đứng giữa phía trước, các bạn còn lại tỏa ra hai bên lùi dần về sau như đội hình bay.",
+      tip: "Biểu cảm: tự tin như nhóm nhạc chụp bìa album 😏",
+      image: null,
+      art: {
+        figs: [
+          { x: 48, face: "😏", s: 0.7, y: -16 },
+          { x: 84, face: "😎", s: 0.8, y: -6 },
+          { x: 120, face: "😏", s: 0.95, y: 4, l: [[-20, 14], [-8, 30]], r: [[20, 14], [8, 30]] },
+          { x: 156, face: "😎", s: 0.8, y: -6 },
+          { x: 192, face: "😏", s: 0.7, y: -16 },
+        ],
+      },
+    },
+  ],
+};
+
+/* Thông tin hiển thị cho từng nhóm */
+const GROUPS = {
+  none:   { title: "Mời bạn bước vào khung hình", chip: "0 người" },
+  solo:   { title: "Dáng chụp Solo",              chip: "1 người" },
+  couple: { title: "Couple / Bestie",             chip: "2 người" },
+  trio:   { title: "Bộ ba Trio",                  chip: "3 người" },
+  group:  { title: "Cả nhóm cùng vui",            chip: "4+ người" },
+};
+const groupOf = (n) => (n <= 0 ? "none" : n === 1 ? "solo" : n === 2 ? "couple" : n === 3 ? "trio" : "group");
+
+/* =====================================================================
+   VẼ HÌNH MINH HỌA SVG (người que)
+   ===================================================================== */
+const STROKE = "#1d4ed8";
+function poly(pts) { return pts.map((p) => p.join(",")).join(" "); }
+
+function figureSVG(f) {
+  const s = f.s || 1, y = f.y || 0, tilt = f.tilt || 0;
+  const l = [[0, -6], ...(f.l || [[-12, 18], [-16, 36]]).map(([x, yy]) => [x, yy - 6])];
+  const r = [[0, -6], ...(f.r || [[12, 18], [16, 36]]).map(([x, yy]) => [x, yy - 6])];
+  const legs = f.legs === "spread" ? [[-24, 64], [24, 64]] : [[-11, 68], [11, 68]];
+  return `
+  <g transform="translate(${f.x},${84 + y}) scale(${s})" stroke="${STROKE}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <line x1="0" y1="-12" x2="0" y2="34"/>
+    <polyline points="${poly([legs[0], [0, 34], legs[1]])}"/>
+    <polyline points="${poly(l)}"/>
+    <polyline points="${poly(r)}"/>
+    <g transform="rotate(${tilt} 0 -12)">
+      <circle cx="0" cy="-26" r="13" fill="#eff6ff"/>
+      <text x="0" y="-21" font-size="15" text-anchor="middle" stroke="none" fill="#000">${f.face || ""}</text>
+    </g>
+  </g>`;
+}
+
+function headSVG(h) {
+  return `<g stroke="${STROKE}" stroke-width="4" fill="#eff6ff">
+    <circle cx="${h.x}" cy="${h.y}" r="13"/>
+    <text x="${h.x}" y="${h.y + 5}" font-size="15" text-anchor="middle" stroke="none" fill="#000">${h.face}</text>
+  </g>`;
+}
+
+function renderArt(art) {
+  const ground = '<ellipse cx="120" cy="154" rx="104" ry="5" fill="#dbeafe"/>';
+  const extra = art.extra || "";
+  const figs = (art.figs || []).map(figureSVG).join("");
+  const heads = (art.heads || []).map(headSVG).join("");
+  const fx = (art.fx || []).map((e) => `<text x="${e.x}" y="${e.y}" font-size="${e.size || 18}" text-anchor="middle">${e.t}</text>`).join("");
+  return `<svg viewBox="0 0 240 162" xmlns="http://www.w3.org/2000/svg" role="img">${ground}${extra}${figs}${heads}${fx}</svg>`;
+}
+
+function renderPoseVisual(pose) {
+  if (pose.image) {
+    return `<img src="${pose.image}" alt="${pose.name}" class="max-h-full max-w-full object-contain rounded-xl"/>`;
+  }
+  return renderArt(pose.art || {});
+}
+
+/* Hình chờ khi chưa có ai */
+const WAITING_ART = renderArt({
+  figs: [{ x: 120, face: "👋", s: 1, r: [[14, -12], [22, -34]] }],
+  fx: [{ t: "📷", x: 60, y: 60, size: 26 }, { t: "✨", x: 180, y: 50, size: 20 }],
+});
+
+/* =====================================================================
+   TRẠNG THÁI & DOM
+   ===================================================================== */
+const $ = (id) => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+
+const state = {
+  model: null,
+  showBoxes: true,
+  persons: [],
+  // Chống nhiễu
+  stableCount: -1,
+  candidate: null,
+  candidateSince: 0,
+  // Gợi ý
+  group: null,
+  poseIndex: 0,
+  shooting: false,
+  lastDetect: 0,
+  busy: false,
+};
+
+/* =====================================================================
+   CAMERA + MODEL
+   ===================================================================== */
+async function init() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return showError("Trình duyệt không hỗ trợ camera",
+      "Hãy mở file bằng Chrome/Edge/Safari bản mới, qua http://localhost hoặc https.");
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await new Promise((res) => (video.onloadedmetadata = res));
+    await video.play();
+  } catch (err) {
+    console.error(err);
+    return showError("Không truy cập được camera",
+      "Hãy bấm biểu tượng camera / ổ khóa trên thanh địa chỉ → chọn “Cho phép”, rồi tải lại trang. " +
+      "Kiểm tra camera không bị ứng dụng khác (Zoom, Meet…) chiếm dụng.");
+  }
+
+  $("loaderText").textContent = "Đang tải mô hình nhận diện…";
+  try {
+    await tf.setBackend("webgl").catch(() => {});
+    await tf.ready();
+    state.model = await cocoSsd.load({ base: CONFIG.MODEL_BASE });
+  } catch (err) {
+    console.error(err);
+    return showError("Không tải được mô hình AI", "Lần chạy đầu cần Internet để tải thư viện. Kiểm tra mạng rồi tải lại trang.");
+  }
+
+  $("loader").remove();
+  $("statusDot").classList.replace("bg-amber-400", "bg-emerald-500");
+  $("btnShoot").disabled = false;
+  $("btnShuffle").disabled = false;
+  setGroup("none");
+  requestAnimationFrame(loop);
+}
+
+function showError(title, sub) {
+  $("loader").querySelector(".animate-spin")?.remove();
+  $("loaderText").textContent = title;
+  $("loaderSub").textContent = sub;
+  $("statusDot").classList.replace("bg-amber-400", "bg-red-500");
+}
+
+/* =====================================================================
+   VÒNG LẶP NHẬN DIỆN
+   ===================================================================== */
+async function loop(now) {
+  requestAnimationFrame(loop);
+  if (!state.busy && now - state.lastDetect >= CONFIG.DETECT_INTERVAL && video.readyState >= 2) {
+    state.busy = true;
+    state.lastDetect = now;
+    try {
+      const preds = await state.model.detect(video, CONFIG.MAX_DETECTIONS, CONFIG.MIN_SCORE);
+      state.persons = preds.filter((p) => p.class === "person" && p.score >= CONFIG.MIN_SCORE);
+    } catch (e) { console.warn(e); }
+    state.busy = false;
+  }
+  $("liveCount").textContent = state.persons.length;
+  stabilize(state.persons.length, performance.now());
+  drawBoxes();
+}
+
+/* ---------- Thuật toán chống nhiễu: chỉ đổi khi giữ ổn định 1.5s ---------- */
+function stabilize(n, now) {
+  if (n !== state.candidate) {
+    state.candidate = n;
+    state.candidateSince = now;
+  }
+  const held = now - state.candidateSince;
+  const pendingChange = state.candidate !== state.stableCount;
+  const wrap = $("stabilizeWrap");
+
+  if (pendingChange && held >= CONFIG.STABLE_MS) {
+    state.stableCount = state.candidate;
+    const g = groupOf(state.stableCount);
+    if (g !== state.group) setGroup(g);
+    wrap.classList.add("hidden"); wrap.classList.remove("flex");
+  } else if (pendingChange && groupOf(state.candidate) !== state.group) {
+    // Chỉ hiện thanh tiến trình khi việc thay đổi sẽ làm đổi nhóm gợi ý
+    wrap.classList.remove("hidden"); wrap.classList.add("flex");
+    $("stabilizeBar").style.width = Math.min(100, (held / CONFIG.STABLE_MS) * 100) + "%";
+  } else {
+    wrap.classList.add("hidden"); wrap.classList.remove("flex");
+  }
+}
+
+/* ---------- Vẽ bounding box (khớp video object-cover + lật gương) ---------- */
+function drawBoxes() {
+  const cw = overlay.clientWidth, ch = overlay.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (overlay.width !== cw * dpr || overlay.height !== ch * dpr) {
+    overlay.width = cw * dpr; overlay.height = ch * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+  if (!state.showBoxes || state.shooting) return;
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const scale = Math.max(cw / vw, ch / vh);
+  const offX = (cw - vw * scale) / 2, offY = (ch - vh * scale) / 2;
+
+  state.persons.forEach((p, i) => {
+    const [x, y, w, h] = p.bbox;
+    const bx = cw - (offX + (x + w) * scale); // lật gương theo trục X
+    const by = offY + y * scale, bw = w * scale, bh = h * scale;
+
+    ctx.strokeStyle = "rgba(96,165,250,.95)";
+    ctx.lineWidth = 2;
+    roundRect(bx, by, bw, bh, 12); ctx.stroke();
+
+    const label = `Người ${i + 1} · ${Math.round(p.score * 100)}%`;
+    ctx.font = "600 13px 'Be Vietnam Pro', sans-serif";
+    const tw = ctx.measureText(label).width + 16;
+    const ly = Math.max(by - 26, 4);
+    ctx.fillStyle = "rgba(29,78,216,.92)";
+    roundRect(bx, ly, tw, 22, 11); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.fillText(label, bx + 8, ly + 15.5);
+  });
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* =====================================================================
+   HIỂN THỊ GỢI Ý
+   ===================================================================== */
+function setGroup(g) {
+  state.group = g;
+  const list = POSE_DATABASE[g] || [];
+  state.poseIndex = list.length ? Math.floor(Math.random() * list.length) : 0;
+  $("groupTitle").textContent = GROUPS[g].title;
+  $("groupChip").textContent = GROUPS[g].chip;
+  renderPose();
+}
+
+function renderPose() {
+  const list = POSE_DATABASE[state.group] || [];
+  const card = $("poseCard");
+  card.classList.remove("card-enter"); void card.offsetWidth; card.classList.add("card-enter");
+
+  if (!list.length) {
+    $("poseArt").innerHTML = WAITING_ART;
+    $("poseName").textContent = "Bước vào trước ống kính nhé!";
+    $("poseDesc").textContent = "Hệ thống sẽ tự đếm số người và gợi ý dáng chụp phù hợp nhất cho bạn.";
+    $("poseTip").textContent = "";
+    $("thumbs").innerHTML = "";
+    $("btnShuffle").disabled = true;
+    return;
+  }
+  $("btnShuffle").disabled = false;
+  const pose = list[state.poseIndex];
+  $("poseArt").innerHTML = renderPoseVisual(pose);
+  $("poseName").textContent = pose.name;
+  $("poseDesc").textContent = pose.desc;
+  $("poseTip").textContent = pose.tip || "";
+
+  $("thumbs").innerHTML = list.map((p, i) => `
+    <button class="thumb aspect-square rounded-xl border-2 border-slate-100 bg-slate-50 p-1 hover:border-blue-300 transition"
+      data-i="${i}" title="${p.name}" aria-current="${i === state.poseIndex}">
+      ${p.image ? `<img src="${p.image}" class="w-full h-full object-cover rounded-lg" alt="">` : renderArt(p.art || {})}
+    </button>`).join("");
+}
+
+function shufflePose() {
+  const list = POSE_DATABASE[state.group] || [];
+  if (list.length < 2) return;
+  let next;
+  do { next = Math.floor(Math.random() * list.length); } while (next === state.poseIndex);
+  state.poseIndex = next;
+  renderPose();
+}
+
+$("thumbs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-i]");
+  if (!b) return;
+  state.poseIndex = +b.dataset.i;
+  renderPose();
+});
+
+/* =====================================================================
+   CHỤP THỬ (Countdown 3-2-1 + Flash + Tải ảnh)
+   ===================================================================== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function shoot() {
+  if (state.shooting || !state.model) return;
+  state.shooting = true;
+  $("btnShoot").disabled = true;
+  const cd = $("countdown"), num = $("countdownNum");
+  cd.classList.remove("hidden"); cd.classList.add("flex");
+  for (let i = CONFIG.COUNTDOWN_FROM; i > 0; i--) {
+    num.textContent = i;
+    num.classList.remove("count-pop"); void num.offsetWidth; num.classList.add("count-pop");
+    await sleep(1000);
+  }
+  cd.classList.add("hidden"); cd.classList.remove("flex");
+
+  // Chụp khung hình (lật gương giống những gì khách nhìn thấy)
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  const cx = c.getContext("2d");
+  cx.translate(c.width, 0); cx.scale(-1, 1);
+  cx.drawImage(video, 0, 0, c.width, c.height);
+
+  const flash = $("flash");
+  flash.classList.remove("flash"); void flash.offsetWidth; flash.classList.add("flash");
+
+  const url = c.toDataURL("image/jpeg", 0.92);
+  $("previewImg").src = url;
+  const a = $("btnDownload");
+  a.href = url;
+  a.download = `photobooth-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.jpg`;
+
+  await sleep(350);
+  const m = $("previewModal");
+  m.classList.remove("hidden"); m.classList.add("flex");
+  state.shooting = false;
+  $("btnShoot").disabled = false;
+}
+
+function closePreview() {
+  const m = $("previewModal");
+  m.classList.add("hidden"); m.classList.remove("flex");
+}
+
+/* =====================================================================
+   SỰ KIỆN
+   ===================================================================== */
+$("btnShoot").addEventListener("click", shoot);
+$("btnShuffle").addEventListener("click", shufflePose);
+$("btnClose").addEventListener("click", closePreview);
+$("btnRetake").addEventListener("click", () => { closePreview(); shoot(); });
+$("previewModal").addEventListener("click", (e) => { if (e.target.id === "previewModal") closePreview(); });
+
+function toggleBoxes() {
+  state.showBoxes = !state.showBoxes;
+  $("btnDebug").setAttribute("aria-pressed", state.showBoxes);
+}
+$("btnDebug").addEventListener("click", toggleBoxes);
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen?.();
+}
+$("btnFull").addEventListener("click", toggleFullscreen);
+
+document.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
+  const modalOpen = !$("previewModal").classList.contains("hidden");
+  if (e.key === "Escape" && modalOpen) return closePreview();
+  if (modalOpen) return;
+  if (e.code === "Space") { e.preventDefault(); shoot(); }
+  else if (e.key === "s" || e.key === "S") shufflePose();
+  else if (e.key === "d" || e.key === "D") toggleBoxes();
+  else if (e.key === "f" || e.key === "F") toggleFullscreen();
+});
+
+init();
+</script>
+</body>
+</html>
